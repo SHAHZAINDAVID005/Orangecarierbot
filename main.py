@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-import os
-import re
+import requests
 import json
-import asyncio
-import logging
-import aiohttp
-import aioredis
+import re
 import time
+import logging
+import threading
+import os
+import urllib3
 from datetime import datetime
 from telegram import Bot
+import asyncio
+import redis.asyncio as redis  # Updated Redis Asyncio
 from telegram.error import TelegramError
-from aiohttp import ClientSession, ClientConnectorError
 
-# === Whisper AI ===
-import openai
-openai.api_key = os.getenv("OPENAI_API_KEY")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ================== CONFIG ==================
+# ================== CONFIG (FROM ENV) ==================
 EMAIL = os.getenv("EMAIL")
 PASSWORD = os.getenv("PASSWORD")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -30,12 +29,15 @@ LIVE_CALL_ENDPOINT = "https://www.orangecarrier.com/live/calls/lives"
 SOUND_ENDPOINT = "https://www.orangecarrier.com/live/calls/sound"
 
 DOWNLOAD_DIR = "downloads"
+
+POLLING_INTERVAL = 2
 RECONNECT_DELAY = 5
-CLEANUP_INTERVAL = 3600  # seconds
-MAX_FILE_AGE = 3600  # seconds
 # ============================================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 COUNTRY_FLAGS = {
     'AF': '🇦🇫','AL': '🇦🇱','DZ': '🇩🇿','US': '🇺🇸','NG': '🇳🇬','GB': '🇬🇧','FR': '🇫🇷',
@@ -48,15 +50,31 @@ COUNTRY_FLAGS = {
 def get_flag(code):
     return COUNTRY_FLAGS.get((code or "").upper(), "❓")
 
+def load_json(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return default
+
+def save_json(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except:
+        pass
+
 def mask_number(num):
     num = str(num).replace("+", "")
     if num.isdigit() and len(num) >= 7:
         return f"{num[:4]}****{num[-3:]}"
     return num
 
-def create_caption(did, duration, country, code, otp=None):
+def create_caption(did, duration, country, code):
     now = datetime.now().strftime("%I:%M:%S %p")
-    caption = (
+    return (
         f"🔥 <b>NEW CALL {country.upper()} {get_flag(code)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🌍 <b>Country:</b> {country} {get_flag(code)}\n"
@@ -64,201 +82,118 @@ def create_caption(did, duration, country, code, otp=None):
         f"⏳ <b>Duration:</b> {duration}s\n"
         f"⏰ <b>Time:</b> {now}"
     )
-    if otp:
-        caption += f"\n🔑 <b>Detected OTP:</b> {otp}"
-    return caption
 
-def extract_otp(text):
-    match = re.search(r'\b(\d{4,8})\b', text)
-    return match.group(1) if match else None
+def download_audio(session, call_id, uuid):
+    if not uuid:
+        return None
+    path = os.path.join(DOWNLOAD_DIR, f"{call_id}-{uuid}.mp3")
+    try:
+        r = session.get(f"{SOUND_ENDPOINT}?id={call_id}&uuid={uuid}", stream=True, verify=False)
+        with open(path, "wb") as f:
+            for c in r.iter_content(8192):
+                if c:
+                    f.write(c)
+        return path
+    except:
+        return None
 
-def cleanup_downloads():
-    if not os.path.exists(DOWNLOAD_DIR):
-        return
-    now = time.time()
-    for filename in os.listdir(DOWNLOAD_DIR):
-        path = os.path.join(DOWNLOAD_DIR, filename)
-        if os.path.isfile(path):
-            age = now - os.path.getmtime(path)
-            if age > MAX_FILE_AGE:
-                try:
-                    os.remove(path)
-                    logging.info(f"Deleted old file: {filename}")
-                except Exception as e:
-                    logging.error(f"Failed to delete {filename}: {e}")
-
-class OrangeCarrierBot:
+class OrangeCarrier:
     def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
         self.bot = Bot(BOT_TOKEN)
-        self.session = None
         self.sid = None
-        self.redis = None
-        self.audio_tasks = set()
+        self.seen = set()
+        self.running = True
+        self.stats = {"success": 0, "failed": 0}
+        # Redis connection
+        self.redis = redis.from_url(REDIS_URL, decode_responses=True)
+        asyncio.get_event_loop().run_until_complete(self.redis.ping())
+        logging.info("✅ Connected to Redis")
 
-    async def connect_redis(self):
-        self.redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
+    def login(self):
+        r = self.session.get(LOGIN_URL, verify=False)
+        token = re.search(r'name="_token" value="([^"]+)"', r.text)
+        if not token:
+            return False
+        payload = {"_token": token.group(1), "email": EMAIL, "password": PASSWORD}
+        r2 = self.session.post(LOGIN_URL, data=payload, allow_redirects=False, verify=False)
+        logging.info("✅ Login successful")
+        return r2.status_code in (200, 302)
 
-    async def login(self):
-        async with ClientSession() as session:
-            async with session.get(LOGIN_URL, ssl=False) as r:
-                text = await r.text()
-            token = re.search(r'name="_token" value="([^"]+)"', text)
-            if not token:
-                await self.alert_admin("❌ Login token not found.")
-                return False
-            payload = {"_token": token.group(1), "email": EMAIL, "password": PASSWORD}
-            async with session.post(LOGIN_URL, data=payload, ssl=False, allow_redirects=False) as r2:
-                if r2.status in (200, 302):
-                    logging.info("✅ Login successful")
-                    self.session = session
-                    return True
-                await self.alert_admin(f"❌ Login failed with status {r2.status}")
-                return False
+    def socket_handshake(self):
+        r = self.session.get(SOCKET_URL, params={"EIO": "4", "transport": "polling"}, verify=False)
+        self.sid = json.loads(r.text[1:])["sid"]
+        logging.info(f"✅ Socket SID {self.sid}")
 
-    async def alert_admin(self, message):
-        try:
-            await self.bot.send_message(ADMIN_ID, message)
-        except TelegramError as e:
-            logging.error(f"Admin alert failed: {e}")
-
-    async def socket_handshake(self):
-        async with self.session.get(SOCKET_URL, params={"EIO": "4", "transport": "polling"}, ssl=False) as r:
-            text = await r.text()
-        try:
-            self.sid = json.loads(text[1:])["sid"]
-            logging.info(f"✅ Socket SID {self.sid}")
-        except Exception as e:
-            await self.alert_admin(f"❌ Socket handshake failed: {e}")
-
-    async def join_room(self):
+    def join_room(self):
         p = {"EIO": "4", "transport": "polling", "sid": self.sid}
-        await self.session.post(SOCKET_URL, params=p, data="40", ssl=False)
-        await self.session.post(
+        self.session.post(SOCKET_URL, params=p, data="40", verify=False)
+        self.session.post(
             SOCKET_URL,
             params=p,
             data=f'42["join_user_room",{{"room":"user:{EMAIL}:orange:internal"}}]',
-            ssl=False
+            verify=False
         )
         logging.info("✅ Joined room")
 
-    async def download_audio(self, call_id, uuid):
-        if not uuid:
-            return None
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        path = os.path.join(DOWNLOAD_DIR, f"{call_id}-{uuid}.mp3")
-        try:
-            async with self.session.get(f"{SOUND_ENDPOINT}?id={call_id}&uuid={uuid}", ssl=False) as r:
-                with open(path, "wb") as f:
-                    while True:
-                        chunk = await r.content.read(8192)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-            return path
-        except Exception as e:
-            await self.alert_admin(f"❌ Audio download failed: {e}")
-            return None
-
-    async def transcribe_audio(self, audio_path):
-        if not audio_path or not os.path.exists(audio_path):
-            return None
-        try:
-            with open(audio_path, "rb") as f:
-                transcript = openai.Audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f
-                )
-            return transcript.text
-        except Exception as e:
-            logging.error(f"Transcription failed: {e}")
-            return None
-
-    async def fetch_call_info(self, cid):
-        try:
-            async with self.session.post(LIVE_CALL_ENDPOINT, data={"id": cid}, ssl=False) as r:
-                return await r.json()
-        except Exception as e:
-            await self.alert_admin(f"❌ Fetch call info failed: {e}")
-            return {}
-
-    async def process_call(self, cid, did, uuid, country, code):
-        if await self.redis.sismember("seen_calls", cid):
+    def poll(self):
+        r = self.session.get(SOCKET_URL, params={"EIO": "4", "transport": "polling", "sid": self.sid}, verify=False)
+        if r.text.strip() == "2":
+            self.session.post(SOCKET_URL, params={"EIO":"4","transport":"polling","sid":self.sid}, data="3", verify=False)
             return
-        await self.redis.sadd("seen_calls", cid)
+        for part in r.text.split("\n"):
+            if part.startswith("42"):
+                ev, data = json.loads(part[2:])
+                if ev == "new_call":
+                    threading.Thread(
+                        target=self.process_call,
+                        args=(data["id"], data["did"], data["uuid"], data["country"], data["country_code"]),
+                        daemon=True
+                    ).start()
 
-        await asyncio.sleep(5)
-        info = await self.fetch_call_info(cid)
+    def process_call(self, cid, did, uuid, country, code):
+        # Check Redis for duplicate
+        if asyncio.get_event_loop().run_until_complete(self.redis.sismember("seen_calls", cid)):
+            return
+        asyncio.get_event_loop().run_until_complete(self.redis.sadd("seen_calls", cid))
+
+        time.sleep(5)
+        info = self.session.post(LIVE_CALL_ENDPOINT, data={"id": cid}, verify=False).json()
         duration = info.get("duration", 0)
-        audio = await self.download_audio(cid, uuid)
 
-        async def handle_transcription_and_send(audio_path):
-            otp = None
-            if audio_path:
-                transcript = await self.transcribe_audio(audio_path)
-                otp = extract_otp(transcript) if transcript else None
+        caption = create_caption(did, duration, country, code)
+        audio = download_audio(self.session, cid, uuid)
 
-            caption = create_caption(did, duration, country, code, otp)
-
-            try:
-                if audio_path:
-                    with open(audio_path, "rb") as f:
-                        await self.bot.send_audio(CHAT_ID, f, caption=caption, parse_mode="HTML")
-                else:
-                    await self.bot.send_message(CHAT_ID, caption, parse_mode="HTML")
-                await self.redis.hincrby("stats", "success", 1)
-            except TelegramError as e:
-                await self.redis.hincrby("stats", "failed", 1)
-                await self.alert_admin(f"❌ Telegram send failed: {e}")
-
-        task = asyncio.create_task(handle_transcription_and_send(audio))
-        self.audio_tasks.add(task)
-        task.add_done_callback(self.audio_tasks.discard)
-
-    async def poll_socket(self):
         try:
-            async with self.session.get(SOCKET_URL, params={"EIO": "4", "transport": "polling", "sid": self.sid}, ssl=False) as r:
-                text = await r.text()
-            if text.strip() == "2":
-                await self.session.post(SOCKET_URL, params={"EIO":"4","transport":"polling","sid":self.sid}, data="3", ssl=False)
-                return
-            for part in text.split("\n"):
-                if part.startswith("42"):
-                    ev, data = json.loads(part[2:])
-                    if ev == "new_call":
-                        asyncio.create_task(self.process_call(
-                            data["id"], data["did"], data["uuid"], data["country"], data["country_code"]
-                        ))
-        except ClientConnectorError:
-            await self.alert_admin("❌ Socket disconnected, reconnecting...")
-            await asyncio.sleep(RECONNECT_DELAY)
-            await self.socket_handshake()
-            await self.join_room()
-        except Exception as e:
-            logging.error(f"Polling error: {e}")
+            if audio:
+                with open(audio, "rb") as f:
+                    asyncio.run(self.bot.send_audio(CHAT_ID, f, caption=caption, parse_mode="HTML"))
+            else:
+                asyncio.run(self.bot.send_message(CHAT_ID, caption, parse_mode="HTML"))
+            # Increment success
+            asyncio.get_event_loop().run_until_complete(self.redis.hincrby("stats", "success", 1))
+        except TelegramError as e:
+            logging.error(f"Telegram error: {e}")
+            asyncio.get_event_loop().run_until_complete(self.redis.hincrby("stats", "failed", 1))
 
-    async def periodic_cleanup(self):
-        while True:
-            cleanup_downloads()
-            await asyncio.sleep(CLEANUP_INTERVAL)
-
-    async def run(self):
-        await self.connect_redis()
-        asyncio.create_task(self.periodic_cleanup())
-        while True:
+    def start(self):
+        if not self.login():
+            logging.error("❌ Login failed")
+            return
+        self.socket_handshake()
+        self.join_room()
+        logging.info("🚀 Monitor Active")
+        while self.running:
             try:
-                if not await self.login():
-                    await asyncio.sleep(RECONNECT_DELAY)
-                    continue
-                await self.socket_handshake()
-                await self.join_room()
-                logging.info("🚀 Monitor Active")
-                while True:
-                    await self.poll_socket()
-                    await asyncio.sleep(0.5)
+                self.poll()
             except Exception as e:
-                logging.error(f"Main loop error: {e}")
-                await self.alert_admin(f"❌ Bot crashed: {e}")
-                await asyncio.sleep(RECONNECT_DELAY)
+                logging.error(f"Polling error: {e}")
+                time.sleep(RECONNECT_DELAY)
+                self.socket_handshake()
+                self.join_room()
+            time.sleep(POLLING_INTERVAL)
 
 if __name__ == "__main__":
-    asyncio.run(OrangeCarrierBot().run())
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    OrangeCarrier().start()
